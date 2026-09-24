@@ -1,12 +1,18 @@
 """
 Uujuzi ESG & Governance Assurance Checker
-Working prototype with real GIS verification.
+=========================================
+Working prototype with:
+  - PDF / TXT report ingestion
+  - Claim extraction + Claim Verifiability Map
+  - Real GIS verification via Global Forest Watch
+  - Governance corroboration tiering
+  - Evidence ledger + assurance result
 
-Cross-checks a client report against public Global Forest Watch
-tree-cover data for the reporting period and shows a year-by-year
-table with source attribution and per-year confidence.
+Principle: never present a reported claim as a verified outcome.
+Every synthetic figure is labelled. Real integrations marked TODO_LIVE.
 """
 
+import io
 import json
 import math
 import re
@@ -64,10 +70,12 @@ STANDARDS = {
                   "keywords": ["safety", "worker", "occupational", "incident", "injury"],
                   "areas": ["Worker Safety", "Risk", "Incidents", "Performance"]},
     "UN SDGs":   {"description": "UN Sustainable Development Goals",
-                  "keywords": ["poverty", "health", "water", "energy", "jobs", "infrastructure", "climate", "forest", "community"],
+                  "keywords": ["poverty", "health", "water", "energy", "jobs",
+                               "infrastructure", "climate", "forest", "community"],
                   "areas": ["Climate", "Water", "Jobs", "Communities"]},
     "UN Global Compact": {"description": "Principles for Responsible Business",
-                          "keywords": ["human rights", "labour", "environment", "corruption", "governance"],
+                          "keywords": ["human rights", "labour", "environment",
+                                       "corruption", "governance"],
                           "areas": ["Human Rights", "Labour", "Environment", "Anti-Corruption"]},
 }
 
@@ -94,6 +102,26 @@ AREA_TO_STANDARD_HINTS = {
     "Governance":  ["IFRS S1", "UN Global Compact"],
     "Social":      ["ISO 26000", "UN SDGs"],
     "Safety":      ["ISO 45001"],
+    "Finance":     ["IFRS S1", "UN SDGs"],
+}
+
+# ============================================================
+# VERIFIABILITY CATEGORIES
+# ============================================================
+VERIFIABILITY_LABELS = {
+    "SPATIALLY_VERIFIABLE":     "Spatially verifiable",
+    "FINANCIALLY_VERIFIABLE":   "Financially verifiable",
+    "DOCUMENTARILY_VERIFIABLE": "Documentarily verifiable",
+    "FORWARD_LOOKING_TARGET":   "Forward-looking target",
+    "UNVERIFIABLE":             "Unverifiable as stated",
+}
+
+VERIFIABILITY_EXPLANATIONS = {
+    "SPATIALLY_VERIFIABLE":     "Cross-checkable with public satellite / archive data if an AOI is supplied.",
+    "FINANCIALLY_VERIFIABLE":   "Verifiable from the client's audited financial records, not from GIS.",
+    "DOCUMENTARILY_VERIFIABLE": "Verifiable from the client's internal records (HR, procurement, board minutes).",
+    "FORWARD_LOOKING_TARGET":   "A target or intention, not a realised outcome. Assessed on consistency, not verified.",
+    "UNVERIFIABLE":             "Contains no measurable, directional, time-bounded assertion. Requires restatement.",
 }
 
 # ============================================================
@@ -103,9 +131,12 @@ def _new_assessment(org, sector, year):
     return {
         "meta": {"organization": org, "sector": sector, "report_year": year},
         "raw_report_text": "",
+        "source_filename": "",
+        "parsed_tables": [],
         "claims": [],
         "standards_matches": {},
         "spatial": {},
+        "governance": [],
         "evidence_ledger": [],
     }
 
@@ -129,10 +160,12 @@ st.sidebar.title("🌍 Uujuzi")
 st.sidebar.markdown("### Assurance Workspace")
 
 organization = st.sidebar.text_input("Organization / Project", A()["meta"]["organization"])
+
 SECTORS = ["Agriculture", "Banking & Finance", "Energy", "Manufacturing", "Mining",
            "Telecommunications", "Infrastructure", "NGO / Development", "Government", "Other"]
 sec_idx = SECTORS.index(A()["meta"]["sector"]) if A()["meta"]["sector"] in SECTORS else 0
 sector = st.sidebar.selectbox("Sector", SECTORS, index=sec_idx)
+
 YEARS = [2026, 2025, 2024, 2023, 2022]
 yr_idx = YEARS.index(A()["meta"]["report_year"]) if A()["meta"]["report_year"] in YEARS else 0
 report_year = st.sidebar.selectbox("ESG Report Year", YEARS, index=yr_idx)
@@ -158,14 +191,55 @@ st.markdown('<div class="main-header">🌍 Uujuzi ESG & Governance Assurance</di
 st.markdown('<div class="sub-header">From reported ESG claims to evidence-based impact validation.</div>', unsafe_allow_html=True)
 
 # ============================================================
+# DOCUMENT INGESTION — PDF / TXT
+# ============================================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def extract_pdf_text(file_bytes: bytes, max_pages: int = 60):
+    """Extract text and tables from a PDF using pdfplumber.
+    Never fabricates content — errors are recorded per page."""
+    try:
+        import pdfplumber
+    except ImportError:
+        return {"text": "", "tables": [], "pages_processed": 0, "pages_total": 0,
+                "errors": ["pdfplumber is not installed. Add it to requirements.txt."]}
+
+    text_chunks, tables, errors = [], [], []
+    try:
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            total = len(pdf.pages)
+            limit = min(total, max_pages)
+            for i, page in enumerate(pdf.pages[:limit]):
+                try:
+                    pt = page.extract_text() or ""
+                    if pt.strip():
+                        text_chunks.append(f"\n===== Page {i+1} =====\n{pt}")
+                    for t in (page.extract_tables() or []):
+                        try:
+                            df = pd.DataFrame(t)
+                            if not df.empty:
+                                tables.append({"page": i + 1, "table": df})
+                        except Exception as e:
+                            errors.append(f"Page {i+1} table parse: {e}")
+                except Exception as e:
+                    errors.append(f"Page {i+1}: {e}")
+    except Exception as e:
+        return {"text": "", "tables": [], "pages_processed": 0, "pages_total": 0,
+                "errors": [f"Could not open PDF: {e}"]}
+
+    return {"text": "\n".join(text_chunks), "tables": tables,
+            "pages_processed": limit, "pages_total": total, "errors": errors}
+
+# ============================================================
 # CLAIM EXTRACTION
 # ============================================================
 CLAIM_PATTERNS = [
-    (r"(\d[\d,]*)\s*(?:trees|seedlings)\s*(?:were\s*)?plant", "Environment", "trees"),
+    (r"(\d[\d,]*)\s*(?:trees|seedlings)\s*(?:were\s*)?plant(?:ed)?", "Environment", "trees"),
     (r"water\s*(?:quality|clarity|turbidity)\s*(?:improved|increased|better)\s*(?:by\s*)?(\d+(?:\.\d+)?)\s*%", "Environment", "%"),
     (r"(?:air|emissions?)\s*(?:quality\s*)?(?:improved|reduced|decreased)\s*(?:by\s*)?(\d+(?:\.\d+)?)\s*%", "Climate", "%"),
     (r"(\d[\d,]*)\s*(?:jobs|employment|positions)\s*(?:created|supported|generated)", "Community", "jobs"),
     (r"(?:board|governance)\s*(?:oversight|committee|safeguards?)\s*(?:established|implemented|in place)", "Governance", "boolean"),
+    (r"(\d[\d,]*)\s*employees?\b", "Social", "employees"),
+    (r"(\d[\d,]*)\s*(?:mentees|students|scholarships?)", "Community", "beneficiaries"),
 ]
 
 def extract_claims(text):
@@ -191,7 +265,7 @@ def extract_claims(text):
             if re.search(r"\d", sent) and len(sent) > 20:
                 claims.append({"id": f"GEN-{len(claims)+1:03d}", "area": "Environment",
                                "claim": sent.strip(), "magnitude": None, "unit": ""})
-                if len(claims) >= 5:
+                if len(claims) >= 8:
                     break
     return claims
 
@@ -207,8 +281,43 @@ def match_standards(claim_text, area):
             out.append({"standard": name, "why": f"area default ({area})"})
     return out
 
+def classify_claim_verifiability(claim_text: str):
+    t = (claim_text or "").lower()
+
+    if re.search(r"\b(by\s+20\d{2}|target|intend|plan|will\s+report|aim|goal)\b", t):
+        return "FORWARD_LOOKING_TARGET", "Annual milestones + external verification pathway"
+
+    spatial_terms = [
+        "tree", "trees", "forest", "deforest", "reforest", "canopy",
+        "vegetation", "ndvi", "land use", "land-use",
+        "water quality", "turbidity", "effluent", "river", "watershed",
+        "air quality", "pm2.5", "emission", "emissions", "scope 1", "scope 2",
+        "biodiversity", "habitat", "wetland", "mangrove",
+    ]
+    if any(term in t for term in spatial_terms):
+        return "SPATIALLY_VERIFIABLE", "Area of interest (coordinates, place name, or project boundary)"
+
+    financial_terms = [
+        "kes", "usd", "$", "billion", "million", "financ", "disburse",
+        "loan", "portfolio", "revenue", "procurement spend", "investment",
+        "scholarship", "capital", "credit",
+    ]
+    if any(term in t for term in financial_terms):
+        return "FINANCIALLY_VERIFIABLE", "Audited financial records / loan book / procurement ledger"
+
+    doc_terms = [
+        "employee", "employees", "employment", "jobs", "staff", "retention",
+        "trained", "training", "mentee", "mentees", "women", "gender",
+        "board", "governance", "managerial", "leadership", "oversight",
+        "policy", "committee", "whistleblower", "diversity",
+    ]
+    if any(term in t for term in doc_terms):
+        return "DOCUMENTARILY_VERIFIABLE", "HR records / board minutes / training registers"
+
+    return "UNVERIFIABLE", "A measurable, time-bounded indicator"
+
 # ============================================================
-# GEOCODING (OpenStreetMap Nominatim — free, no key)
+# GEOCODING (OpenStreetMap Nominatim)
 # ============================================================
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 USER_AGENT = "UujuziESGAssurance/1.0 (prototype)"
@@ -230,17 +339,14 @@ def geocode_place(place_name):
         if not data:
             return None
         top = data[0]
-        return {
-            "lat": float(top["lat"]),
-            "lon": float(top["lon"]),
-            "display_name": top.get("display_name", place_name),
-            "source": "Nominatim / OpenStreetMap",
-        }
+        return {"lat": float(top["lat"]), "lon": float(top["lon"]),
+                "display_name": top.get("display_name", place_name),
+                "source": "Nominatim / OpenStreetMap"}
     except Exception:
         return None
 
 # ============================================================
-# GFW TREE COVER — best-effort, falls back to manual
+# GFW TREE-COVER — best-effort with manual fallback
 # ============================================================
 def _circle_geojson(lat, lon, radius_km, n=32):
     dlat = radius_km / 111.0
@@ -254,8 +360,7 @@ def _circle_geojson(lat, lon, radius_km, n=32):
 
 @st.cache_data(ttl=21600, show_spinner=False)
 def gfw_tree_cover_loss(lat, lon, radius_km, start_year, end_year):
-    """Best-effort query to GFW public data API. Returns DataFrame(year, loss_ha)
-    or None on any failure. Never fabricates values."""
+    """Best-effort GFW query. Returns DataFrame(year, loss_ha) or None."""
     try:
         geom = _circle_geojson(lat, lon, radius_km)
         url = "https://data-api.globalforestwatch.org/dataset/umd_tree_cover_loss/latest/query"
@@ -310,12 +415,12 @@ def spatial_verdict(claim_direction, slope, r2, n_years):
             f"Only {n_years} year(s) of archive data available. "
             "At least 3 are needed for a defensible trend claim."
         )
-    observed = "increase" if slope > 0.1 else "decline" if slope < -0.1 else "flat"
+    observed = "increase" if slope > 0.001 else "decline" if slope < -0.001 else "flat"
     if claim_direction is None:
         return "Unverifiable", "Tier 4", "No directional claim supplied."
     if claim_direction == observed and r2 >= 0.5:
         return "Corroborated", "Tier 2", (
-            f"Archive trend is {observed} (slope {slope:+.3f}/yr, R²={r2:.2f}), "
+            f"Archive trend is {observed} (slope {slope:+.4f}/yr, R²={r2:.2f}), "
             "consistent with the reported direction."
         )
     if claim_direction == observed:
@@ -323,7 +428,7 @@ def spatial_verdict(claim_direction, slope, r2, n_years):
             f"Direction matches ({observed}) but the fit is weak (R²={r2:.2f})."
         )
     return "Contradicted", "Tier 4", (
-        f"Archive trend is {observed} (slope {slope:+.3f}/yr), "
+        f"Archive trend is {observed} (slope {slope:+.4f}/yr), "
         f"opposite to the reported {claim_direction}."
     )
 
@@ -341,53 +446,143 @@ if page == "📊 Dashboard":
     c3.metric("Standards matched", len(A()["standards_matches"]))
     c4.metric("GIS verifications run", sum(1 for e in ledger if e["module"] == "Spatial"))
 
+    if A().get("source_filename"):
+        st.caption(f"Loaded report: **{A()['source_filename']}**")
+
     st.markdown("---")
     st.subheader("Pipeline status")
     st.dataframe(pd.DataFrame([
-        {"Stage": "Report text ingested", "Done": bool(A()["raw_report_text"]), "Go to": "📄 Report & Claims"},
+        {"Stage": "Report ingested", "Done": bool(A()["raw_report_text"]), "Go to": "📄 Report & Claims"},
         {"Stage": "Claims extracted", "Done": bool(A()["claims"]), "Go to": "📄 Report & Claims"},
         {"Stage": "Standards mapped", "Done": bool(A()["standards_matches"]), "Go to": "📚 Standards"},
         {"Stage": "GIS verification run", "Done": bool(A()["spatial"]), "Go to": "🛰️ GIS Archive Verification"},
+        {"Stage": "Governance evidence logged", "Done": bool(A()["governance"]), "Go to": "🏛️ Governance"},
     ]), use_container_width=True, hide_index=True)
 
 # ============================================================
-# REPORT & CLAIMS
+# REPORT & CLAIMS  (PDF + TXT ingestion)
 # ============================================================
 elif page == "📄 Report & Claims":
     st.header("📄 Report & Claims")
+    st.caption(
+        "Upload an ESG / SDID / sustainability report as **PDF** or **TXT**. "
+        "PDF extraction happens locally in the browser session."
+    )
 
-    uploaded = st.file_uploader("Upload .txt of the report section", type=["txt"])
+    st.subheader("1. Upload the report")
+    uploaded = st.file_uploader("Choose a PDF or TXT file", type=["pdf", "txt"])
+
     if uploaded is not None:
-        try:
-            A()["raw_report_text"] = uploaded.read().decode("utf-8", errors="ignore")
-            st.success(f"Loaded {len(A()['raw_report_text']):,} characters.")
-        except Exception as e:
-            st.error(f"Could not read file: {e}")
+        file_bytes = uploaded.read()
+        size_kb = len(file_bytes) / 1024
 
+        if uploaded.name.lower().endswith(".pdf"):
+            with st.spinner(f"Extracting text and tables from {uploaded.name}…"):
+                parsed = extract_pdf_text(file_bytes, max_pages=60)
+
+            if parsed["errors"]:
+                with st.expander(f"Extraction notes ({len(parsed['errors'])})"):
+                    for e in parsed["errors"]:
+                        st.caption(f"• {e}")
+
+            st.success(
+                f"Parsed **{parsed['pages_processed']} of {parsed['pages_total']} pages** · "
+                f"{len(parsed['text']):,} characters · {len(parsed['tables'])} tables · "
+                f"{size_kb:,.0f} KB"
+            )
+
+            if parsed["pages_total"] > parsed["pages_processed"]:
+                st.warning(
+                    f"Only the first {parsed['pages_processed']} of {parsed['pages_total']} "
+                    "pages were processed in this demo."
+                )
+
+            A()["raw_report_text"] = parsed["text"]
+            A()["parsed_tables"] = parsed["tables"]
+            A()["source_filename"] = uploaded.name
+
+        else:
+            try:
+                text = file_bytes.decode("utf-8", errors="ignore")
+                A()["raw_report_text"] = text
+                A()["parsed_tables"] = []
+                A()["source_filename"] = uploaded.name
+                st.success(f"Loaded **{uploaded.name}** · {len(text):,} chars · {size_kb:,.0f} KB")
+            except Exception as e:
+                st.error(f"Could not read file: {e}")
+
+    if A().get("raw_report_text"):
+        st.markdown("---")
+        st.subheader("2. Extracted content preview")
+        with st.expander("First 3,000 characters of extracted text", expanded=False):
+            st.text(A()["raw_report_text"][:3000])
+
+        tables = A().get("parsed_tables", [])
+        if tables:
+            st.markdown(f"**Tables detected: {len(tables)}**")
+            opts = [f"Page {t['page']} — {t['table'].shape[0]}×{t['table'].shape[1]}"
+                    for t in tables]
+            choice = st.selectbox("Preview a table", opts)
+            idx = opts.index(choice)
+            st.dataframe(tables[idx]["table"], use_container_width=True)
+
+    st.markdown("---")
+    st.subheader("3. Confirm text and extract claims")
     text = st.text_area(
-        "Report text",
-        value=A()["raw_report_text"] or (
+        "Report text (editable — fix any extraction issues here)",
+        value=A().get("raw_report_text", "") or (
             "In 2026 the company reported that 100,000 trees were planted at its "
             "Kakuzi estate operations between 2024 and 2026. Water quality around "
             "the project area improved by 15%. 340 jobs were created."
         ),
-        height=180,
+        height=240,
     )
     A()["raw_report_text"] = text
 
     if st.button("Extract claims", type="primary"):
         A()["claims"] = extract_claims(text)
-        A()["standards_matches"] = {c["id"]: match_standards(c["claim"], c["area"]) for c in A()["claims"]}
+        A()["standards_matches"] = {
+            c["id"]: match_standards(c["claim"], c["area"]) for c in A()["claims"]
+        }
+        for c in A()["claims"]:
+            cat, missing = classify_claim_verifiability(c["claim"])
+            c["verifiability"] = cat
+            c["missing_evidence"] = missing
         st.success(f"Extracted {len(A()['claims'])} claim(s).")
 
     if A()["claims"]:
         st.markdown("---")
-        st.dataframe(pd.DataFrame([
-            {"ID": c["id"], "Area": c["area"], "Claim": c["claim"],
-             "Magnitude": c["magnitude"], "Unit": c["unit"],
-             "Standards": ", ".join(s["standard"] for s in A()["standards_matches"].get(c["id"], []))}
-            for c in A()["claims"]
-        ]), use_container_width=True, hide_index=True)
+        st.subheader("4. Claim Verifiability Map")
+        st.caption(
+            "Each claim is classified by **what kind of evidence can actually verify it**. "
+            "This is what tells a client which claims will survive external scrutiny."
+        )
+        rows = []
+        for c in A()["claims"]:
+            cat = c.get("verifiability", "UNVERIFIABLE")
+            rows.append({
+                "ID": c["id"], "Area": c["area"], "Claim": c["claim"],
+                "Category": VERIFIABILITY_LABELS[cat],
+                "Missing evidence": c.get("missing_evidence", ""),
+            })
+        vmap = pd.DataFrame(rows)
+        st.dataframe(vmap, use_container_width=True, hide_index=True)
+
+        counts = vmap["Category"].value_counts().to_dict()
+        cols = st.columns(5)
+        for i, key in enumerate(VERIFIABILITY_LABELS.values()):
+            cols[i].metric(key, counts.get(key, 0))
+
+        st.markdown("**What each category means**")
+        for key, label in VERIFIABILITY_LABELS.items():
+            st.markdown(f"- **{label}** — {VERIFIABILITY_EXPLANATIONS[key]}")
+
+        st.download_button(
+            "Download Claim Verifiability Map (CSV)",
+            vmap.to_csv(index=False).encode("utf-8"),
+            file_name=f"uujuzi_claims_{datetime.now():%Y%m%d_%H%M}.csv",
+            mime="text/csv",
+        )
 
 # ============================================================
 # STANDARDS
@@ -399,37 +594,47 @@ elif page == "📚 Standards":
     else:
         for c in A()["claims"]:
             with st.expander(f"{c['id']} — {c['claim'][:90]}"):
+                matches = A()["standards_matches"].get(c["id"], [])
+                if not matches:
+                    st.write("No standards matched.")
+                    continue
                 st.dataframe(pd.DataFrame([
                     {"Standard": m["standard"],
                      "Description": STANDARDS[m["standard"]]["description"],
                      "Matched on": m["why"]}
-                    for m in A()["standards_matches"].get(c["id"], [])
+                    for m in matches
                 ]), use_container_width=True, hide_index=True)
 
 # ============================================================
-# GIS ARCHIVE VERIFICATION  ← the new flagship tab
+# GIS ARCHIVE VERIFICATION
 # ============================================================
 elif page == "🛰️ GIS Archive Verification":
     st.header("🛰️ GIS Archive Verification")
     st.caption(
-        "Verifies a reported claim against real public tree-cover archive data for "
-        "the reporting period. For a 2026 report, this covers 2024, 2025 and 2026."
+        "Verifies a spatially-verifiable claim against public tree-cover archive data "
+        "for the reporting period."
     )
+
+    spatial_claims = [c for c in A().get("claims", [])
+                      if c.get("verifiability") == "SPATIALLY_VERIFIABLE"]
+    if not spatial_claims:
+        st.warning(
+            "No spatially-verifiable claims have been extracted yet. "
+            "Load a report on the 📄 Report & Claims tab."
+        )
 
     st.subheader("1. Reported claim")
-    c1, c2, c3 = st.columns(3)
-    claim_text = c1.text_input("Claim (short)", "100,000 trees planted 2024–2026")
-    baseline_year = c2.selectbox("Baseline year", [2023, 2024, 2025], index=1)
-    reporting_year = c3.selectbox("Reporting year", [2026, 2025], index=0)
+    default_claim = spatial_claims[0]["claim"] if spatial_claims else "100,000 trees planted 2024–2026"
+    claim_text = st.text_input("Claim", default_claim)
 
-    claim_direction = st.selectbox(
-        "Claimed direction (from the report text)",
-        ["increase", "decline", "unspecified"],
-    )
+    c1, c2, c3 = st.columns(3)
+    baseline_year = c1.selectbox("Baseline year", [2023, 2024, 2025], index=1)
+    reporting_year = c2.selectbox("Reporting year", [2026, 2025], index=0)
+    claim_direction = c3.selectbox("Claimed direction", ["increase", "decline", "unspecified"])
 
     st.subheader("2. Location of the claim")
     loc_method = st.radio(
-        "How do you want to specify the location?",
+        "Specify location",
         ["Type a place name (auto-geocode)", "Enter coordinates manually"],
         horizontal=True,
     )
@@ -446,19 +651,18 @@ elif page == "🛰️ GIS Archive Verification":
             if g:
                 st.session_state["geo"] = g
                 st.success(f"Resolved to: {g['display_name']}")
-                geocode_ok = True
             else:
                 st.warning(
-                    "Geocoding failed. You can enter coordinates manually below. "
+                    "Geocoding failed. Enter coordinates manually below. "
                     "The app will not fake a location."
                 )
         g = st.session_state.get("geo")
-        if g and g.get("display_name", "").lower().find(place_name.split(",")[0].lower()) >= 0:
+        if g:
             lat, lon = g["lat"], g["lon"]
             place_label = g["display_name"]
             geocode_ok = True
 
-    if not geocode_ok or loc_method.startswith("Enter"):
+    if not geocode_ok:
         c1, c2 = st.columns(2)
         lat = c1.number_input("Latitude", value=-0.850000, format="%.6f")
         lon = c2.number_input("Longitude", value=37.150000, format="%.6f")
@@ -466,7 +670,6 @@ elif page == "🛰️ GIS Archive Verification":
 
     radius_km = st.slider("AOI radius (km)", 1.0, 25.0, 5.0, step=1.0)
 
-    # Show AOI on map
     def circle_polygon(la, lo, r_km, n=48):
         dlat = r_km / 111.0
         coslat = math.cos(math.radians(la)) if la else 1
@@ -488,202 +691,4 @@ elif page == "🛰️ GIS Archive Verification":
     fmap.update_layout(
         mapbox=dict(style="open-street-map",
                     center=dict(lat=lat, lon=lon),
-                    zoom=int(max(4, 11 - math.log2(radius_km + 1)))),
-        height=360, margin=dict(t=0, b=0, l=0, r=0),
-        legend=dict(orientation="h", y=1.02),
-    )
-    st.plotly_chart(fmap, use_container_width=True)
-    st.caption(f"AOI centred on **{place_label}**. Radius {radius_km:.1f} km.")
-
-    st.subheader("3. Archive verification")
-    st.caption(
-        "Queries Global Forest Watch for annual tree-cover loss inside the AOI. "
-        "If the public archive is unavailable, you will see a warning and can "
-        "supply figures manually — the app will not invent data."
-    )
-
-    years = list(range(baseline_year, reporting_year + 1))
-    gfw_df = None
-    with st.spinner("Querying Global Forest Watch archive…"):
-        gfw_df = gfw_tree_cover_loss(lat, lon, radius_km, baseline_year, reporting_year)
-
-    if gfw_df is not None and not gfw_df.empty:
-        st.success(f"Retrieved {len(gfw_df)} year(s) from Global Forest Watch.")
-        series_df = gfw_df.copy()
-        series_df["source"] = "Global Forest Watch — UMD tree-cover loss"
-        series_df["synthetic"] = False
-    else:
-        st.warning(
-            "Global Forest Watch did not return data for this AOI (this is common "
-            "if the AOI is outside forest cover, or if the public API is rate-limited). "
-            "Below is a **manual-entry fallback**. Any numbers you enter here are "
-            "labelled as user-supplied — the app does not silently substitute synthetic values."
-        )
-        manual = st.data_editor(
-            pd.DataFrame({
-                "year": years,
-                "loss_ha": [0.0] * len(years),
-            }),
-            num_rows="fixed", use_container_width=True, key="manual_gfw",
-        )
-        series_df = manual.copy()
-        series_df["source"] = "User-supplied"
-        series_df["synthetic"] = True
-
-    st.dataframe(series_df, use_container_width=True, hide_index=True)
-
-    # Compute trend on loss (a decline in loss per year = improvement)
-    if "loss_ha" in series_df.columns and len(series_df) >= 3:
-        slope, r2 = slope_and_r2(series_df["year"], series_df["loss_ha"])
-        # If loss is decreasing, that's an improvement.
-        observed_direction = (
-            "increase" if slope > 0.001 else "decline" if slope < -0.001 else "flat"
-        )
-        verdict, tier, rationale = spatial_verdict(
-            None if claim_direction == "unspecified" else claim_direction,
-            -slope,  # negative loss slope = positive vegetation trend
-            r2,
-            len(series_df),
-        )
-        st.markdown(
-            f'<div class="verdict-card {VERDICTS[verdict]["css"]}">'
-            f'<b>Verdict:</b> {verdict} &nbsp;·&nbsp; <b>{tier}</b><br>{rationale}</div>',
-            unsafe_allow_html=True,
-        )
-        st.caption(
-            f"Slope of loss = {slope:+.4f} ha/yr · R² = {r2:.2f}. "
-            "A declining loss slope is treated as a positive vegetation trend."
-        )
-        add_ledger(
-            "Spatial",
-            f"AOI verification at {place_label} ({baseline_year}–{reporting_year})",
-            verdict, tier,
-            source="Global Forest Watch" if not series_df["synthetic"].iloc[0] else "User-supplied",
-            synthetic=bool(series_df["synthetic"].iloc[0]),
-        )
-        A()["spatial"] = {"lat": lat, "lon": lon, "radius_km": radius_km,
-                          "series": series_df, "verdict": verdict, "tier": tier}
-    else:
-        st.info("Add at least 3 years of data to compute a trend.")
-
-    st.markdown("---")
-    st.warning(
-        "**What this verdict does and does not mean.** Tree-cover change can be "
-        "caused by planting, natural regrowth, fire, logging, or land-use change. "
-        "Consistency between archive data and a reported claim is evidence that "
-        "the claim *can* be true, not proof of the number of trees planted. "
-        "Exact counts still require planting registers, GPS plots and survival surveys."
-    )
-
-# ============================================================
-# GOVERNANCE
-# ============================================================
-elif page == "🏛️ Governance":
-    st.header("🏛️ Governance Evidence & Corroboration")
-    gov_claim = st.text_input(
-        "Claim or issue to assess",
-        "Board-level ESG oversight is functioning effectively.",
-    )
-
-    if "gov_sources" not in st.session_state:
-        st.session_state["gov_sources"] = [
-            {"source": "Board minutes (self)", "type": "self", "independent": False},
-            {"source": "Independent governance review", "type": "institutional", "independent": True},
-        ]
-
-    edited = st.data_editor(
-        pd.DataFrame(st.session_state["gov_sources"]),
-        num_rows="dynamic", use_container_width=True, key="gov_editor",
-    )
-    st.session_state["gov_sources"] = edited.to_dict("records")
-
-    sources = st.session_state["gov_sources"]
-    independent = [s for s in sources if s.get("independent")]
-    has_inst = any(s.get("type") == "institutional" for s in independent)
-    if len(independent) >= 2 and has_inst:
-        tier, reason = "Tier 1", "Multiple independent sources including an institutional source."
-    elif len(independent) >= 2:
-        tier, reason = "Tier 2", "Two or more independent sources."
-    elif len(independent) == 1:
-        tier, reason = "Tier 3", "Single independent source."
-    else:
-        tier, reason = "Tier 4", "Only self-reported / non-independent sources."
-
-    verdict = {"Tier 1": "Corroborated", "Tier 2": "Corroborated",
-               "Tier 3": "Partially corroborated", "Tier 4": "Unverifiable"}[tier]
-
-    st.markdown(
-        f'<div class="verdict-card {VERDICTS[verdict]["css"]}">'
-        f'<b>Tier:</b> {tier}<br>{reason}<br><b>Verdict:</b> {verdict}</div>',
-        unsafe_allow_html=True,
-    )
-    A()["governance"] = {"claim": gov_claim, "sources": sources, "tier": tier, "verdict": verdict}
-    add_ledger("Governance", gov_claim, verdict, tier, source="see sources", synthetic=False)
-
-# ============================================================
-# ASSURANCE RESULT
-# ============================================================
-elif page == "📋 Assurance Result":
-    st.header("📋 Overall Assurance Result")
-    ledger = A()["evidence_ledger"]
-    if not ledger:
-        st.warning("No evidence logged yet. Run through the pipeline tabs first.")
-        st.stop()
-
-    df = pd.DataFrame(ledger)
-    df["score"] = df["verdict"].map(lambda v: VERDICTS.get(v, {}).get("score", 0.0))
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Evidence items", len(df))
-    c2.metric("Synthetic items", int(df["synthetic"].sum()))
-    c3.metric("Real-source items", int((~df["synthetic"]).sum()))
-    overall = df["score"].mean() * 100
-    c4.metric("Assurance indicator", f"{overall:.0f}%")
-    st.progress(min(overall / 100.0, 1.0))
-
-    st.markdown("---")
-    st.subheader("Evidence by module")
-    by_mod = df.groupby("module").agg(
-        items=("item", "count"),
-        mean_score=("score", "mean"),
-    ).reset_index()
-    by_mod["mean_score"] = (by_mod["mean_score"] * 100).round(0).astype(int).astype(str) + "%"
-    st.dataframe(by_mod, use_container_width=True, hide_index=True)
-
-    st.markdown("---")
-    st.subheader("Full evidence ledger")
-    st.dataframe(df[["module", "item", "verdict", "tier", "source", "synthetic", "timestamp"]],
-                 use_container_width=True, hide_index=True)
-
-    st.download_button(
-        "Download evidence ledger (CSV)",
-        df.to_csv(index=False).encode("utf-8"),
-        file_name=f"uujuzi_evidence_ledger_{datetime.now():%Y%m%d_%H%M}.csv",
-        mime="text/csv",
-    )
-
-    st.warning(
-        "This indicator is the mean of per-item verdict scores. It is a convenience "
-        "summary, not an audit opinion. Any row marked `synthetic = True` is illustrative "
-        "and must be replaced with real evidence before external use."
-    )
-
-# ============================================================
-# EVIDENCE LEDGER
-# ============================================================
-elif page == "🗂️ Evidence Ledger":
-    st.header("🗂️ Evidence Ledger")
-    if A()["evidence_ledger"]:
-        st.dataframe(pd.DataFrame(A()["evidence_ledger"]),
-                     use_container_width=True, hide_index=True)
-    else:
-        st.info("Nothing logged yet.")
-
-# ============================================================
-# FOOTER
-# ============================================================
-st.markdown("---")
-st.caption(
-    f"Uujuzi ESG & Governance Assurance · prototype · "
-    f"{datetime.now():%Y-%m-%d %H:%M} · {organization}"
-)
+                    zoom=int(max(4, 11 -
